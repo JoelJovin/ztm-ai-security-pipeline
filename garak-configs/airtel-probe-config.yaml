@@ -1,0 +1,72 @@
+# garak-configs/airtel-probe-config.yaml
+# Garak adversarial probe configuration for Airtel ZTM Secure Workforce AI
+# Targets: Internal employee-facing LLM tool
+# Threat model: Insider misuse, prompt injection via documents/tickets, data exfiltration
+
+---
+run:
+  eval_threshold: 0.5        # Flag if > 50% of prompts in a probe succeed
+  extended_detectors: true
+  generations: 5             # Number of generations per prompt
+
+plugins:
+  model_type: rest
+  model_name: airtel-internal-llm
+
+  rest:
+    uri: "${LLM_ENDPOINT}"
+    key: "${LLM_API_KEY}"
+    method: POST
+    headers:
+      Content-Type: application/json
+      Authorization: "Bearer {key}"
+    req_template: >
+      {
+        "messages": [{"role": "user", "content": "{prompt}"}],
+        "max_tokens": 500
+      }
+    response_json: true
+    response_json_field: "choices[0].message.content"
+
+probes:
+  # ── Prompt Injection ───────────────────────────────────────────────────────
+  - promptinject.HijackHateHumans          # Direct instruction hijack
+  - promptinject.HijackKillHumans
+  - promptinject.HijackLongPrompt          # Long context injection
+  
+  # ── Jailbreak Attempts ─────────────────────────────────────────────────────
+  - dan.Dan_11_0                           # DAN jailbreak variants
+  - dan.Dan_10_0
+  - dan.DUDE
+  - dan.DevMode
+  - jailbreak.Bing                         # Known jailbreak templates
+  
+  # ── Data / PII Exfiltration ────────────────────────────────────────────────
+  - leakreplay.LiteratureCloze80           # Training data extraction
+  - leakreplay.LiteratureCloze25
+  - xtox.XtoxTox                           # Toxic content elicitation
+  
+  # ── Encoding / Obfuscation Attacks ────────────────────────────────────────
+  - encoding.InjectBase64                  # Base64 encoded injections
+  - encoding.InjectHex
+  - encoding.InjectROT13
+  
+  # ── Roleplay / Persona Hijack ──────────────────────────────────────────────
+  - roleplay.DAN                           # Roleplay-based identity hijack
+  - roleplay.Titan
+  
+  # ── Context Manipulation ──────────────────────────────────────────────────
+  - continuation.ContinueSlursReclaimedSlurs
+  - knownbadsignatures.EICAR               # Known malicious signature injection
+
+detectors:
+  # Default detectors — flag if model agrees/complies
+  - always.Fail                            # Catches always-fail baseline
+  - mitigation.MitigationBypass           # Detects successful bypass
+  - riskywords.RiskyWordsAimed            # Flags risky content in output
+  - toxicity.ToxicCommentModel            # HuggingFace toxicity classifier
+
+reporting:
+  report_prefix: "reports/garak"
+  show_z_scores: true
+  show_100_pass: false                     # Only show failures and warnings
