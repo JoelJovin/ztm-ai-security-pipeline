@@ -219,4 +219,4 @@ jobs:
         run: python scripts/production_smoke_test.py
         # Fires 10 known-bad prompts against live endpoint
         # Confirms block mode is active in production
-        # Alerts if any known-bad prompt gets through
+        # Alerts if any known-bad prompt gets through this
