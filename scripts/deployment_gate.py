@@ -1,0 +1,139 @@
+"""
+deployment_gate.py
+Stage 5 — Aggregates all security stage reports and makes final
+deploy/block decision. Generates a PR comment summary.
+"""
+
+import json
+import sys
+import os
+from pathlib import Path
+from datetime import datetime
+
+REPORT_FILES = {
+    "static_scan":    "reports/static-scan-results.json",
+    "garak":          "reports/garak-evaluation.json",
+    "guardrails":     "reports/guardrails-results.json",
+    "owasp":          "reports/owasp-results.json",
+}
+
+def load_report(path: str) -> dict:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"error": f"Report not found: {path}", "missing": True}
+    except Exception as e:
+        return {"error": str(e)}
+
+def main():
+    print("[*] Running deployment gate evaluation...\n")
+
+    reports = {key: load_report(path) for key, path in REPORT_FILES.items()}
+    blocking_failures = []
+    warnings = []
+    stage_statuses = {}
+
+    # ── Evaluate each stage ────────────────────────────────────────────────
+
+    # Stage 1: Static scan
+    static = reports["static_scan"]
+    if static.get("missing"):
+        blocking_failures.append("Static scan report missing")
+        stage_statuses["static_scan"] = "❌ MISSING"
+    elif static.get("critical_findings", 0) > 0:
+        blocking_failures.append(f"Static scan: {static['critical_findings']} critical findings")
+        stage_statuses["static_scan"] = f"❌ FAIL ({static['critical_findings']} critical)"
+    else:
+        stage_statuses["static_scan"] = "✅ PASS"
+
+    # Stage 2: Garak adversarial testing
+    garak = reports["garak"]
+    if garak.get("missing"):
+        blocking_failures.append("Garak adversarial test report missing")
+        stage_statuses["adversarial_testing"] = "❌ MISSING"
+    elif not garak.get("passed", True):
+        failures = garak.get("failures", [])
+        blocking_failures.append(f"Adversarial testing: {len(failures)} probe(s) exceeded threshold")
+        stage_statuses["adversarial_testing"] = f"❌ FAIL ({len(failures)} probes)"
+    else:
+        warn_count = len(garak.get("warnings", []))
+        stage_statuses["adversarial_testing"] = f"✅ PASS{f' ({warn_count} warnings)' if warn_count else ''}"
+        if warn_count:
+            warnings.extend(garak.get("warnings", []))
+
+    # Stage 3: Guardrails validation
+    guardrails = reports["guardrails"]
+    if guardrails.get("missing"):
+        blocking_failures.append("Guardrails validation report missing")
+        stage_statuses["guardrails"] = "❌ MISSING"
+    elif not guardrails.get("pipeline_pass", True):
+        failed = guardrails.get("results", {}).get("failed", [])
+        blocking_failures.append(f"Guardrails: {len(failed)} test(s) failed")
+        stage_statuses["guardrails"] = f"❌ FAIL ({len(failed)} tests)"
+    else:
+        warn_count = len(guardrails.get("results", {}).get("warnings", []))
+        stage_statuses["guardrails"] = f"✅ PASS{f' ({warn_count} false positives)' if warn_count else ''}"
+
+    # Stage 4: OWASP compliance
+    owasp = reports["owasp"]
+    if owasp.get("missing"):
+        blocking_failures.append("OWASP compliance report missing")
+        stage_statuses["owasp_compliance"] = "❌ MISSING"
+    else:
+        failed = owasp.get("results", {}).get("failed", [])
+        warn = owasp.get("results", {}).get("warnings", [])
+        if failed:
+            blocking_failures.append(f"OWASP: {len(failed)} critical check(s) failed")
+            stage_statuses["owasp_compliance"] = f"❌ FAIL ({len(failed)} checks)"
+        else:
+            stage_statuses["owasp_compliance"] = f"✅ PASS{f' ({len(warn)} warnings)' if warn else ''}"
+            warnings.extend(warn)
+
+    # ── Generate PR comment ────────────────────────────────────────────────
+    overall = "🔴 BLOCKED" if blocking_failures else "🟢 APPROVED"
+    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    summary_md = f"""## 🔐 AI Security Pipeline — {overall}
+
+**{timestamp}** | ZTM Secure Workforce AI
+
+| Stage | Status |
+|-------|--------|
+| Stage 1: Static Prompt Analysis | {stage_statuses.get('static_scan', '⚪ SKIPPED')} |
+| Stage 2: Adversarial Testing (Garak) | {stage_statuses.get('adversarial_testing', '⚪ SKIPPED')} |
+| Stage 3: Guardrails Validation | {stage_statuses.get('guardrails', '⚪ SKIPPED')} |
+| Stage 4: OWASP LLM Top 10 Compliance | {stage_statuses.get('owasp_compliance', '⚪ SKIPPED')} |
+
+"""
+
+    if blocking_failures:
+        summary_md += "### ❌ Blocking Issues\n"
+        for f in blocking_failures:
+            summary_md += f"- {f}\n"
+        summary_md += "\n"
+
+    if warnings:
+        summary_md += "### ⚠️ Warnings (non-blocking)\n"
+        for w in warnings[:5]:  # Cap at 5 in PR comment
+            desc = w.get("description", w) if isinstance(w, dict) else str(w)
+            summary_md += f"- {desc}\n"
+        summary_md += "\n"
+
+    summary_md += "_Generated by ZTM AI Security Pipeline_\n"
+
+    os.makedirs("reports", exist_ok=True)
+    with open("reports/security-summary.md", "w") as f:
+        f.write(summary_md)
+
+    print(summary_md)
+
+    if blocking_failures:
+        print(f"\n[FAIL] Deployment BLOCKED — {len(blocking_failures)} blocking issue(s)")
+        sys.exit(1)
+    else:
+        print(f"\n[PASS] Deployment APPROVED — all security gates passed")
+        sys.exit(0)
+
+if __name__ == "__main__":
+    main()
