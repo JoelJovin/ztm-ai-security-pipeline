@@ -1,0 +1,222 @@
+name: AI Security Pipeline — ZTM Secure Workforce
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+    branches: [main]
+
+env:
+  AZURE_CONTENT_SAFETY_ENDPOINT: ${{ secrets.AZURE_CONTENT_SAFETY_ENDPOINT }}
+  AZURE_CONTENT_SAFETY_KEY: ${{ secrets.AZURE_CONTENT_SAFETY_KEY }}
+  LLM_ENDPOINT: ${{ secrets.LLM_ENDPOINT }}
+  LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+
+jobs:
+
+  # ── STAGE 1: Static Analysis of Prompt Templates ──────────────────────────
+  static-prompt-analysis:
+    name: "Stage 1 · Static Prompt Analysis"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install pyyaml semgrep
+
+      - name: Scan prompt templates for injection patterns
+        run: python scripts/static_prompt_scan.py
+        # Checks all .txt / .yaml prompt files for:
+        # - Hardcoded secrets or tokens
+        # - Unclosed user-input slots ({{user_input}} without sanitisation markers)
+        # - Instruction override patterns ("ignore previous instructions", "you are now")
+        # - Role confusion tokens ("system:", "assistant:" in user-facing templates)
+
+      - name: Semgrep AI security ruleset
+        run: |
+          semgrep --config scripts/semgrep-ai-rules.yaml \
+                  --error \
+                  --json \
+                  --output reports/semgrep-results.json \
+                  . || true
+
+      - name: Upload static analysis report
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-analysis-report
+          path: reports/semgrep-results.json
+
+  # ── STAGE 2: Adversarial Testing with Garak ───────────────────────────────
+  adversarial-testing:
+    name: "Stage 2 · Adversarial Testing (Garak)"
+    runs-on: ubuntu-latest
+    needs: static-prompt-analysis
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Garak
+        run: pip install garak
+
+      - name: Run Garak adversarial probe suite
+        run: |
+          python -m garak \
+            --model_type rest \
+            --model_name airtel-internal-llm \
+            --config garak-configs/airtel-probe-config.yaml \
+            --report_prefix reports/garak \
+            --parallel_attempts 4
+        # Probes fired:
+        # - Prompt injection (direct + indirect)
+        # - Jailbreak attempts (dan, dev-mode, roleplay)
+        # - Data exfiltration probes
+        # - PII extraction attempts
+        # - Context manipulation / multi-turn attacks
+
+      - name: Evaluate Garak results
+        run: python scripts/evaluate_garak_results.py
+        # Fails the pipeline if vulnerability score > threshold
+
+      - name: Upload Garak report
+        uses: actions/upload-artifact@v4
+        with:
+          name: garak-adversarial-report
+          path: reports/garak*
+
+  # ── STAGE 3: Guardrails Validation (Azure AI Content Safety) ──────────────
+  guardrails-validation:
+    name: "Stage 3 · Guardrails Validation"
+    runs-on: ubuntu-latest
+    needs: adversarial-testing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install azure-ai-contentsafety requests
+
+      - name: Run guardrails test suite
+        run: python scripts/guardrails_validation.py
+        # Tests:
+        # - Block mode enabled for Hate / Violence / Sexual / Self-harm
+        # - Severity threshold enforcement (set to 4 for internal workforce tool)
+        # - PII detection and redaction pipeline
+        # - Groundedness check against internal knowledge base
+        # - Input + Output both scanned (not just input)
+
+      - name: Upload guardrails report
+        uses: actions/upload-artifact@v4
+        with:
+          name: guardrails-validation-report
+          path: reports/guardrails-results.json
+
+  # ── STAGE 4: OWASP LLM Top 10 Compliance Check ────────────────────────────
+  owasp-compliance:
+    name: "Stage 4 · OWASP LLM Top 10 Compliance"
+    runs-on: ubuntu-latest
+    needs: guardrails-validation
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pyyaml
+
+      - name: Run OWASP LLM compliance checks
+        run: python scripts/owasp_llm_checks.py
+        # Checks mapped to OWASP LLM Top 10 2025:
+        # LLM01 - Prompt Injection controls present
+        # LLM02 - Sensitive data exposure controls
+        # LLM03 - Supply chain: model card and provenance verified
+        # LLM06 - Excessive agency: tool permissions scoped to least privilege
+        # LLM08 - Vector/RAG: embedding input validation present
+        # LLM09 - Misinformation: groundedness detection enabled
+
+      - name: Upload compliance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: owasp-compliance-report
+          path: reports/owasp-results.json
+
+  # ── STAGE 5: Deployment Gate ───────────────────────────────────────────────
+  deployment-gate:
+    name: "Stage 5 · Deployment Gate"
+    runs-on: ubuntu-latest
+    needs: [static-prompt-analysis, adversarial-testing, guardrails-validation, owasp-compliance]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: reports/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Evaluate deployment gate
+        run: python scripts/deployment_gate.py
+        # Aggregates all stage results
+        # BLOCKS deploy if:
+        #   - Any critical prompt injection vulnerability found
+        #   - Garak vulnerability score > 0.3
+        #   - Guardrails block mode not confirmed active
+        #   - Any OWASP LLM01/LLM02/LLM06 check failed
+        # WARNS (non-blocking) for medium-severity findings
+
+      - name: Post security summary to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('reports/security-summary.md', 'utf8');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
+
+  # ── STAGE 6: Post-Deploy Monitoring Hook ──────────────────────────────────
+  post-deploy-monitoring:
+    name: "Stage 6 · Post-Deploy Monitoring"
+    runs-on: ubuntu-latest
+    needs: deployment-gate
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Register deployment with SIEM
+        run: python scripts/register_deployment.py
+        # Notifies monitoring stack:
+        # - Logs deployment event with model version + config hash
+        # - Arms anomaly detection baseline for new deployment
+        # - Sets alert thresholds for unusual query patterns
+        # - Schedules 24hr post-deploy health check
+
+      - name: Trigger smoke test against production guardrails
+        run: python scripts/production_smoke_test.py
+        # Fires 10 known-bad prompts against live endpoint
+        # Confirms block mode is active in production
+        # Alerts if any known-bad prompt gets through
